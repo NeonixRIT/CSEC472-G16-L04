@@ -1,9 +1,14 @@
 from PIL import Image, ImageFilter
 
+import sys
 import os
 from pathlib import Path
 
 from time import perf_counter
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from queue import Queue
 
 
 def batch(iterable, n):
@@ -87,37 +92,6 @@ def average_images(images: list[Image.Image]) -> Image.Image:
     return Image.frombytes('1', (512, 512), bytes(result_image))
 
 
-def thinner_lines(image: Image.Image, factor: int) -> Image.Image:
-    """
-    Turn image into binary string. 1 = white, 0 = black.
-    take all string of consecutive 0s and replace `factor` with 1s on each side.
-    This results in wider crevases in fingerprint lines.
-    """
-    threshold = factor * 2 + 1
-    binary = bin(int(image.tobytes().hex(), 16))[2:]
-    pad = '1' * factor
-    result = ''
-    i = 0
-    for bit in binary:
-        if bit == '0':
-            j = i
-            tmp = ''
-            while j < len(binary) and binary[j] == '0':
-                tmp += '0'
-                j += 1
-            if len(tmp) > threshold:
-                result += pad + tmp[factor:-factor] + pad
-            else:
-                # result += tmp
-                result += '1' * len(tmp)
-            i += len(tmp)
-        else:
-            result += '1'
-            i += 1
-    # result = ''.join(['1' if bit == '0' else '0' for bit in result])
-    return Image.frombytes('1', (512, 512), int(result, 2).to_bytes(32768, 'big'))
-
-
 def denoise(image: Image.Image) -> Image.Image:
     """
     if only 25% of pixels in row are black, set all pixels in row to white.
@@ -136,6 +110,22 @@ def denoise(image: Image.Image) -> Image.Image:
             for j in range(len(bin_rows)):
                 bin_rows[j] = bin_rows[j][:i] + '1' + bin_rows[j][i + 1 :]
     return Image.frombytes('1', (512, 512), int(''.join(bin_rows), 2).to_bytes(32768, 'big'))
+
+
+def image_block_chunks(image: Image.Image | str, width: int, height: int, factor: int = 4) -> Image.Image | str:
+    inp = image
+    if isinstance(image, Image.Image):
+        inp = image.tobytes()
+    inp_rows = list(batch(inp, width))
+    block_chunks = [[] for _ in range(height // factor)]
+    print(len(inp_rows), len(inp_rows[0]))
+    input()
+    for i in range(0, len(inp_rows), factor):
+        for j in range(0, len(inp_rows[i]), factor):
+            chunk = [inp_rows[k][j : j + factor] for k in range(i, i + factor)]
+            print(i // factor, len(block_chunks))
+            block_chunks[i // factor].append(chunk)
+    return block_chunks
 
 
 def get_bounds(image: Image.Image) -> tuple[int, int, int, int]:
@@ -209,30 +199,63 @@ def normalize_image(image: Image.Image, threshhold_modifier: int = 0) -> Image.I
     return res
 
 
-def main():
-    print('Getting samples data...')
-    error = None
-    start = perf_counter()
-    for _, data in get_samples_data().items():
-        if _ == 1:
-            stop = perf_counter()
-            print(f'done in {stop - start:.2f}s.\n')
+async def save_image(image: Image.Image, path: str):
+    image.save(path)
+    with open(path.replace('norm', 'sd04').rstrip('png') + 'txt', 'r') as f:
+        with open(path.rstrip('png') + 'txt', 'w') as f2:
+            f2.write(f.read())
 
-        # data['f'].show()
-        # data['s'].show()
-        try:
-            f_image = normalize_image(data['f'])
-            s_image = normalize_image(data['s'])
-        except (Exception, KeyboardInterrupt) as e:
-            print(f'Error: {e}')
-            print(_)
-            data['f'].show()
-            data['s'].show()
-            error = e
-    print(f'Normalized all images in {perf_counter() - start:.2f}s.')
-    if error:
-        raise error
+
+async def save_images(images: list[list[str, Image.Image]]):
+    tasks = []
+    for path, image in images:
+        task = asyncio.ensure_future(save_image(image, path))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+
+async def load_normalize_and_save_images():
+    print('Normalizing images...')
+    norm_images = []
+    start = perf_counter()
+    with ProcessPoolExecutor(max_workers=16) as executor:
+        futures_f = {executor.submit(normalize_image, data['f']): data['f_path'] for _, data in get_samples_data().items()}
+        futures_s = {executor.submit(normalize_image, data['s']): data['s_path'] for _, data in get_samples_data().items()}
+        for future, path in (futures_f | futures_s).items():
+            norm_images.append([path.replace('sd04', 'norm'), future.result()])
+    stop = perf_counter()
+    print(f'Done in {stop - start:.2f}s.\n')
+    print('Saving images...')
+    start = perf_counter()
+    await save_images(norm_images)
+    stop = perf_counter()
+    print(f'Done in {stop - start:.2f}s.\n')
+
+
+def get_normalized_image_data():
+    image_data: dict[int, dict[str, Image.Image | str | int]] = {i: {'f': [], 's': [], 'f_path': '', 's_path': '', 'f_txt_path': '', 's_txt_path': '', 'gender': '', 'class': '', 'history': '', 'finger': 0} for i in range(1, 2001)}
+    figs_path = Path(__file__).parent / 'NISTSpecialDatabase4GrayScaleImagesofFIGS/norm/png_txt'
+    for root, _, files in os.walk(figs_path):
+        for file in files:
+            if file.endswith('.png'):
+                image_type = file[0] + '_path'
+                image_id = int(file[1:].split('.')[0].split('_')[0])
+                image_data[image_id][image_type] = str(Path(root, file))
+                image_data[image_id][image_type[0]] = Image.open(str(Path(root, file)))
+                image_data[image_id]['finger'] = int(file.split('_')[1].split('.')[0])
+            elif file.endswith('.txt'):
+                image_id = int(file[1:].split('.')[0].split('_')[0])
+                image_data[image_id][file[0] + '_txt_path'] = str(Path(root, file))
+                with open(str(Path(root, file)), 'r') as f:
+                    data = {k: v for k, v in [line.strip().split(': ') for line in f.readlines()]}
+                    for k, v in data.items():
+                        image_data[image_id][k.lower()] = v
+    return image_data
+
+
+def main():
+    pass
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(load_normalize_and_save_images())
